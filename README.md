@@ -42,6 +42,7 @@ Requires Docker and Node.js on macOS, Linux, or Windows through WSL. See [how th
 | Automate scraping from your app | [REST API](#rest-api) |
 | Run a multi-user scraping platform | [SaaS Edition](docs/saas.md) |
 | Follow common workflows | [Recipes](docs/recipes.md) |
+| Integrate with CRM via Webhooks | [CRM Integration](docs/crm-integration.md) |
 
 ![Example GIF](img/example.gif)
 

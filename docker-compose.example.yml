@@ -1,0 +1,14 @@
+services:
+  gmaps-scraper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: gmaps-custom-scraper
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - API_KEY=${API_KEY:-my-secure-api-key}
+    volumes:
+      - ./gmapsdata:/gmapsdata
+    command: ["-data-folder", "/gmapsdata"]

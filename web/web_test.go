@@ -280,3 +280,175 @@ func TestIndexEnablesHTMXTemplateFragments(t *testing.T) {
 		t.Fatal("index.html must enable htmx template fragments, or the job list swap drops #job-tbody")
 	}
 }
+
+func TestJobDataValidateWebhookURL(t *testing.T) {
+	t.Parallel()
+
+	validJob := func(webhookURL string) JobData {
+		return JobData{
+			Keywords:   []string{"plumbers in dallas"},
+			Lang:       "en",
+			Depth:      1,
+			MaxTime:    time.Minute * 5,
+			WebhookURL: webhookURL,
+		}
+	}
+
+	tests := []struct {
+		name    string
+		url     string
+		wantErr bool
+	}{
+		{name: "empty url allowed", url: "", wantErr: false},
+		{name: "valid https url", url: "https://my-crm.com/api/webhook", wantErr: false},
+		{name: "valid http url", url: "http://localhost:3000/webhook", wantErr: false},
+		{name: "invalid scheme", url: "ftp://my-crm.com/api/webhook", wantErr: true},
+		{name: "missing host", url: "https:///webhook", wantErr: true},
+		{name: "invalid string", url: "not-a-valid-url", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			jobData := validJob(tt.url)
+			err := jobData.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestApiScrapeWithWebhookURL(t *testing.T) {
+	t.Parallel()
+
+	repo := &mutableJobRepo{}
+	srv := newTestServerWithRepo(t, repo)
+
+	reqBody := `{
+		"name": "Webhook Scrape",
+		"keywords": ["coffee shops"],
+		"lang": "en",
+		"depth": 1,
+		"max_time": 300,
+		"webhook_url": "https://my-crm.com/webhook"
+	}`
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/jobs", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	srv.apiScrape(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201 Created, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	if len(repo.jobs) != 1 {
+		t.Fatalf("expected 1 job created, got %d", len(repo.jobs))
+	}
+
+	created := repo.jobs[0]
+	if created.Data.WebhookURL != "https://my-crm.com/webhook" {
+		t.Errorf("webhook_url = %q, want %q", created.Data.WebhookURL, "https://my-crm.com/webhook")
+	}
+}
+
+func TestAuthMiddleware(t *testing.T) {
+	t.Parallel()
+
+	repo := &mutableJobRepo{}
+	svc := NewService(repo, t.TempDir())
+	const secret = "test-secret-key-12345"
+
+	srv, err := New(svc, ":0", secret)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// 1. API request without auth -> 401 JSON
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/jobs", http.NoBody)
+	rec := httptest.NewRecorder()
+	srv.srv.Handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for missing API key, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "Unauthorized") {
+		t.Fatalf("expected Unauthorized message in JSON body, got: %s", rec.Body.String())
+	}
+
+	// 2. API request with wrong X-API-Key -> 401 JSON
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/jobs", http.NoBody)
+	req.Header.Set("X-API-Key", "wrong-key")
+	rec = httptest.NewRecorder()
+	srv.srv.Handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for wrong API key, got %d", rec.Code)
+	}
+
+	// 3. API request with valid X-API-Key -> 200 OK
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/jobs", http.NoBody)
+	req.Header.Set("X-API-Key", secret)
+	rec = httptest.NewRecorder()
+	srv.srv.Handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for valid X-API-Key, got %d", rec.Code)
+	}
+
+	// 4. API request with valid Authorization Bearer -> 200 OK
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/jobs", http.NoBody)
+	req.Header.Set("Authorization", "Bearer "+secret)
+	rec = httptest.NewRecorder()
+	srv.srv.Handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for valid Bearer token, got %d", rec.Code)
+	}
+
+	// 5. Web UI request without auth -> 401 with WWW-Authenticate header
+	req = httptest.NewRequest(http.MethodGet, "/", http.NoBody)
+	rec = httptest.NewRecorder()
+	srv.srv.Handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for unauthenticated Web UI request, got %d", rec.Code)
+	}
+	if rec.Header().Get("WWW-Authenticate") == "" {
+		t.Fatal("expected WWW-Authenticate header for Web UI request, got empty")
+	}
+
+	// 6. Web UI request with Basic Auth -> 200 OK
+	req = httptest.NewRequest(http.MethodGet, "/", http.NoBody)
+	req.SetBasicAuth("admin", secret)
+	rec = httptest.NewRecorder()
+	srv.srv.Handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for Basic Auth Web UI request, got %d", rec.Code)
+	}
+
+	// 7. Web UI request with cookie -> 200 OK
+	req = httptest.NewRequest(http.MethodGet, "/", http.NoBody)
+	req.AddCookie(&http.Cookie{Name: "api_key", Value: secret})
+	rec = httptest.NewRecorder()
+	srv.srv.Handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for cookie authenticated Web UI request, got %d", rec.Code)
+	}
+
+	// 8. Server without APIKey (unprotected mode) allows requests without auth
+	openSrv, err := New(svc, ":0")
+	if err != nil {
+		t.Fatalf("New open server: %v", err)
+	}
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/jobs", http.NoBody)
+	rec = httptest.NewRecorder()
+	openSrv.srv.Handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for open server without API key, got %d", rec.Code)
+	}
+}

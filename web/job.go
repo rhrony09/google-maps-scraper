@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"errors"
+	"net/url"
 	"time"
 )
 
@@ -87,6 +88,7 @@ type JobData struct {
 	ExtraReviews bool          `json:"extra_reviews"`
 	MaxTime      time.Duration `json:"max_time"`
 	Proxies      []string      `json:"proxies"`
+	WebhookURL   string        `json:"webhook_url,omitempty"`
 }
 
 func (d *JobData) Validate() error {
@@ -112,6 +114,13 @@ func (d *JobData) Validate() error {
 
 	if d.FastMode && (d.Lat == "" || d.Lon == "") {
 		return errors.New("missing geo coordinates")
+	}
+
+	if d.WebhookURL != "" {
+		u, err := url.ParseRequestURI(d.WebhookURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return errors.New("invalid webhook url: must be a valid http or https url")
+		}
 	}
 
 	return nil

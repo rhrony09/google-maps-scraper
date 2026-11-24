@@ -3,7 +3,11 @@ package webrunner
 
 import (
 	"context"
+	"encoding/json"
 	"io"
+	"net/http"
+	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -153,4 +157,163 @@ func (r *memoryJobRepo) Count(_ context.Context, params web.SelectParams) (int, 
 func (r *memoryJobRepo) Update(_ context.Context, job *web.Job) error {
 	r.jobs[job.ID] = *job
 	return nil
+}
+
+func TestScrapeJobTriggersWebhookOnSuccess(t *testing.T) {
+	t.Parallel()
+
+	var (
+		mu          sync.Mutex
+		received    WebhookPayload
+		receivedAny bool
+	)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			t.Errorf("decode webhook payload: %v", err)
+		}
+		receivedAny = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	repo := &memoryJobRepo{}
+	svc := web.NewService(repo, t.TempDir())
+	job := web.Job{
+		ID:     "job-webhook-ok",
+		Name:   "dentists",
+		Date:   time.Now().UTC(),
+		Status: web.StatusPending,
+		Data: web.JobData{
+			Keywords:   []string{"dentists in berlin"},
+			Lang:       "en",
+			Zoom:       15,
+			Lat:        "52.5200",
+			Lon:        "13.4050",
+			FastMode:   true,
+			Radius:     1000,
+			Depth:      1,
+			MaxTime:    time.Minute,
+			WebhookURL: ts.URL,
+		},
+	}
+
+	if err := svc.Create(context.Background(), &job); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+
+	done := make(chan struct{})
+	w := &webrunner{
+		svc: svc,
+		cfg: &runner.Config{DataFolder: t.TempDir(), Concurrency: 1},
+		setupMate: func(_ context.Context, _ io.Writer, _ *web.Job) (mateRunner, error) {
+			return fakeMate{}, nil
+		},
+		client: ts.Client(),
+		onWebhookSent: func(j *web.Job, err error) {
+			close(done)
+		},
+	}
+
+	if err := w.scrapeJob(context.Background(), &job); err != nil {
+		t.Fatalf("scrape job: %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for webhook to be sent")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if !receivedAny {
+		t.Fatal("expected webhook to be received, but got none")
+	}
+
+	if received.Event != "job.completed" {
+		t.Errorf("event = %q, want %q", received.Event, "job.completed")
+	}
+	if received.Status != web.StatusOK {
+		t.Errorf("status = %q, want %q", received.Status, web.StatusOK)
+	}
+	if received.ID != job.ID {
+		t.Errorf("id = %q, want %q", received.ID, job.ID)
+	}
+	if received.DownloadURL != "/api/v1/jobs/"+job.ID+"/download" {
+		t.Errorf("download_url = %q, want %q", received.DownloadURL, "/api/v1/jobs/"+job.ID+"/download")
+	}
+}
+
+func TestScrapeJobTriggersWebhookOnFailure(t *testing.T) {
+	t.Parallel()
+
+	var (
+		mu       sync.Mutex
+		received WebhookPayload
+	)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		_ = json.NewDecoder(r.Body).Decode(&received)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	repo := &memoryJobRepo{}
+	svc := web.NewService(repo, t.TempDir())
+	job := web.Job{
+		ID:     "job-webhook-fail",
+		Name:   "bad-job",
+		Date:   time.Now().UTC(),
+		Status: web.StatusPending,
+		Data: web.JobData{
+			Keywords:   []string{}, // Missing keywords triggers failure
+			Lang:       "en",
+			Depth:      1,
+			MaxTime:    time.Minute,
+			WebhookURL: ts.URL,
+		},
+	}
+
+	if err := svc.Create(context.Background(), &job); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+
+	done := make(chan struct{})
+	w := &webrunner{
+		svc: svc,
+		cfg: &runner.Config{DataFolder: t.TempDir(), Concurrency: 1},
+		client: ts.Client(),
+		onWebhookSent: func(j *web.Job, err error) {
+			close(done)
+		},
+	}
+
+	_ = w.scrapeJob(context.Background(), &job)
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for webhook to be sent")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if received.Event != "job.failed" {
+		t.Errorf("event = %q, want %q", received.Event, "job.failed")
+	}
+	if received.Status != web.StatusFailed {
+		t.Errorf("status = %q, want %q", received.Status, web.StatusFailed)
+	}
+	if received.Error == "" {
+		t.Errorf("expected error in payload, got empty")
+	}
 }

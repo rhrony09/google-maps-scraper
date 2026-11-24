@@ -1,12 +1,15 @@
 package webrunner
 
 import (
+	"bytes"
 	"context"
 	"encoding/csv"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,10 +28,12 @@ import (
 )
 
 type webrunner struct {
-	srv       *web.Server
-	svc       *web.Service
-	cfg       *runner.Config
-	setupMate func(context.Context, io.Writer, *web.Job) (mateRunner, error)
+	srv           *web.Server
+	svc           *web.Service
+	cfg           *runner.Config
+	setupMate     func(context.Context, io.Writer, *web.Job) (mateRunner, error)
+	client        *http.Client
+	onWebhookSent func(job *web.Job, err error)
 }
 
 type mateRunner interface {
@@ -56,7 +61,7 @@ func New(cfg *runner.Config) (runner.Runner, error) {
 
 	svc := web.NewService(repo, cfg.DataFolder)
 
-	srv, err := web.New(svc, cfg.Addr)
+	srv, err := web.New(svc, cfg.Addr, cfg.APIKey)
 	if err != nil {
 		return nil, err
 	}
@@ -66,6 +71,7 @@ func New(cfg *runner.Config) (runner.Runner, error) {
 		svc:       svc,
 		cfg:       cfg,
 		setupMate: defaultSetupMate(cfg),
+		client:    &http.Client{Timeout: 30 * time.Second},
 	}
 
 	return &ans, nil
@@ -147,6 +153,8 @@ func (w *webrunner) scrapeJob(ctx context.Context, job *web.Job) error {
 
 	if len(job.Data.Keywords) == 0 {
 		job.Status = web.StatusFailed
+		err = errors.New("missing keywords")
+		w.dispatchWebhook(job, err)
 
 		return w.svc.Update(ctx, job)
 	}
@@ -155,6 +163,13 @@ func (w *webrunner) scrapeJob(ctx context.Context, job *web.Job) error {
 
 	outfile, err := os.Create(outpath)
 	if err != nil {
+		job.Status = web.StatusFailed
+		err2 := w.svc.Update(ctx, job)
+		if err2 != nil {
+			log.Printf("failed to update job status: %v", err2)
+		}
+		w.dispatchWebhook(job, err)
+
 		return err
 	}
 
@@ -175,6 +190,7 @@ func (w *webrunner) scrapeJob(ctx context.Context, job *web.Job) error {
 		if err2 != nil {
 			log.Printf("failed to update job status: %v", err2)
 		}
+		w.dispatchWebhook(job, err)
 
 		return err
 	}
@@ -209,10 +225,12 @@ func (w *webrunner) scrapeJob(ctx context.Context, job *web.Job) error {
 		w.cfg.ExtraReviews || job.Data.ExtraReviews,
 	)
 	if err != nil {
+		job.Status = web.StatusFailed
 		err2 := w.svc.Update(ctx, job)
 		if err2 != nil {
 			log.Printf("failed to update job status: %v", err2)
 		}
+		w.dispatchWebhook(job, err)
 
 		return err
 	}
@@ -243,10 +261,12 @@ func (w *webrunner) scrapeJob(ctx context.Context, job *web.Job) error {
 		if err != nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
 			cancel()
 
+			job.Status = web.StatusFailed
 			err2 := w.svc.Update(ctx, job)
 			if err2 != nil {
 				log.Printf("failed to update job status: %v", err2)
 			}
+			w.dispatchWebhook(job, err)
 
 			return err
 		}
@@ -255,8 +275,13 @@ func (w *webrunner) scrapeJob(ctx context.Context, job *web.Job) error {
 	}
 
 	job.Status = web.StatusOK
+	if err := w.svc.Update(ctx, job); err != nil {
+		return err
+	}
 
-	return w.svc.Update(ctx, job)
+	w.dispatchWebhook(job, nil)
+
+	return nil
 }
 
 func defaultSetupMate(cfg *runner.Config) func(context.Context, io.Writer, *web.Job) (mateRunner, error) {
@@ -313,4 +338,108 @@ func defaultSetupMate(cfg *runner.Config) func(context.Context, io.Writer, *web.
 
 		return scrapemateapp.NewScrapeMateApp(matecfg)
 	}
+}
+
+const (
+	webhookTimeout   = 30 * time.Second
+	webhookUserAgent = "google-maps-scraper/webhook"
+)
+
+// WebhookPayload represents the JSON payload dispatched to a webhook URL upon job completion or failure.
+type WebhookPayload struct {
+	Event       string      `json:"event"`
+	ID          string      `json:"id"`
+	Name        string      `json:"name"`
+	Status      string      `json:"status"`
+	PlacesCount int         `json:"places_count"`
+	DownloadURL string      `json:"download_url,omitempty"`
+	Error       string      `json:"error,omitempty"`
+	CreatedAt   time.Time   `json:"created_at"`
+	Data        web.JobData `json:"data"`
+}
+
+func (w *webrunner) sendWebhook(ctx context.Context, job *web.Job, jobErr error) error {
+	if job.Data.WebhookURL == "" {
+		return nil
+	}
+
+	payload := WebhookPayload{
+		ID:        job.ID,
+		Name:      job.Name,
+		Status:    job.Status,
+		CreatedAt: job.Date,
+		Data:      job.Data,
+	}
+
+	if job.Status == web.StatusOK {
+		payload.Event = "job.completed"
+		payload.DownloadURL = "/api/v1/jobs/" + job.ID + "/download"
+
+		places, err := w.svc.GetPlaces(ctx, job.ID)
+		if err == nil {
+			payload.PlacesCount = len(places)
+		}
+	} else {
+		payload.Event = "job.failed"
+		if jobErr != nil {
+			payload.Error = jobErr.Error()
+		}
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("webhook: failed to marshal payload for job %s: %v", job.ID, err)
+
+		return fmt.Errorf("marshal webhook payload: %w", err)
+	}
+
+	client := w.client
+	if client == nil {
+		client = &http.Client{Timeout: webhookTimeout}
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, job.Data.WebhookURL, bytes.NewReader(body))
+	if err != nil {
+		log.Printf("webhook: failed to create request for job %s: %v", job.ID, err)
+
+		return fmt.Errorf("create webhook request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", webhookUserAgent)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("webhook: failed to deliver to %s for job %s: %v", job.Data.WebhookURL, job.ID, err)
+
+		return fmt.Errorf("deliver webhook: %w", err)
+	}
+
+	defer resp.Body.Close()
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		log.Printf("webhook: %s returned non-2xx status code %d for job %s", job.Data.WebhookURL, resp.StatusCode, job.ID)
+
+		return fmt.Errorf("webhook endpoint returned status %d", resp.StatusCode)
+	}
+
+	log.Printf("webhook: delivered to %s for job %s (status %d)", job.Data.WebhookURL, job.ID, resp.StatusCode)
+
+	return nil
+}
+
+func (w *webrunner) dispatchWebhook(job *web.Job, jobErr error) {
+	if job.Data.WebhookURL == "" {
+		return
+	}
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), webhookTimeout)
+		defer cancel()
+
+		err := w.sendWebhook(ctx, job, jobErr)
+		if w.onWebhookSent != nil {
+			w.onWebhookSent(job, err)
+		}
+	}()
 }

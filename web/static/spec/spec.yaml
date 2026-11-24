@@ -4,6 +4,10 @@ info:
   version: 1.0.0
   description: API for managing job google maps scraping tasks
 
+security:
+  - ApiKeyAuth: []
+  - BearerAuth: []
+
 paths:
   /api/v1/jobs:
     post:
@@ -19,7 +23,8 @@ paths:
                 "lang": "el",
                 "zoom": 15,
                 "depth": 1,
-                "max_time": 3600
+                "max_time": 3600,
+                "webhook_url": "https://my-crm.com/api/webhooks/google-maps"
               }'
       requestBody:
         required: true
@@ -158,6 +163,17 @@ paths:
           description: Internal server error
 
 components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: API key passed in X-API-Key header
+    BearerAuth:
+      type: http
+      scheme: bearer
+      description: API key passed as Bearer token in Authorization header
+
   schemas:
     ApiError:
       type: object
@@ -198,6 +214,10 @@ components:
           type: array
           items:
             type: string
+        webhook_url:
+          type: string
+          description: Optional webhook URL to send HTTP POST notification when job completes or fails
+          example: https://my-crm.com/api/webhooks/google-maps
 
     ApiScrapeResponse:
       type: object
@@ -249,4 +269,8 @@ components:
           type: array
           items:
             type: string
+        webhook_url:
+          type: string
+          description: Optional webhook URL to send HTTP POST notification when job completes or fails
+          example: https://my-crm.com/api/webhooks/google-maps
 

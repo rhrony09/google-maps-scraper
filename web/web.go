@@ -29,15 +29,22 @@ const (
 )
 
 type Server struct {
-	tmpl map[string]*template.Template
-	srv  *http.Server
-	svc  *Service
+	tmpl   map[string]*template.Template
+	srv    *http.Server
+	svc    *Service
+	apiKey string
 }
 
-func New(svc *Service, addr string) (*Server, error) {
+func New(svc *Service, addr string, apiKey ...string) (*Server, error) {
+	var key string
+	if len(apiKey) > 0 {
+		key = apiKey[0]
+	}
+
 	ans := Server{
-		svc:  svc,
-		tmpl: make(map[string]*template.Template),
+		svc:    svc,
+		apiKey: key,
+		tmpl:   make(map[string]*template.Template),
 		srv: &http.Server{
 			Addr:              addr,
 			ReadHeaderTimeout: 10 * time.Second,
@@ -129,7 +136,7 @@ func New(svc *Service, addr string) (*Server, error) {
 		ans.download(w, r)
 	})
 
-	handler := securityHeaders(mux)
+	handler := securityHeaders(ans.authMiddleware(mux))
 	ans.srv.Handler = handler
 
 	tmplsKeys := []string{
@@ -180,18 +187,19 @@ func (s *Server) Start(ctx context.Context) error {
 }
 
 type formData struct {
-	Name     string
-	MaxTime  string
-	Keywords []string
-	Language string
-	Zoom     int
-	FastMode bool
-	Radius   int
-	Lat      string
-	Lon      string
-	Depth    int
-	Email    bool
-	Proxies  []string
+	Name       string
+	MaxTime    string
+	Keywords   []string
+	Language   string
+	Zoom       int
+	FastMode   bool
+	Radius     int
+	Lat        string
+	Lon        string
+	Depth      int
+	Email      bool
+	Proxies    []string
+	WebhookURL string
 }
 
 type ctxKey string
@@ -243,17 +251,18 @@ func (s *Server) index(w http.ResponseWriter, r *http.Request) {
 	}
 
 	data := formData{
-		Name:     "",
-		MaxTime:  "10m",
-		Keywords: []string{},
-		Language: "en",
-		Zoom:     15,
-		FastMode: false,
-		Radius:   10000,
-		Lat:      "0",
-		Lon:      "0",
-		Depth:    10,
-		Email:    false,
+		Name:       "",
+		MaxTime:    "10m",
+		Keywords:   []string{},
+		Language:   "en",
+		Zoom:       15,
+		FastMode:   false,
+		Radius:     10000,
+		Lat:        "0",
+		Lon:        "0",
+		Depth:      10,
+		Email:      false,
+		WebhookURL: "",
 	}
 
 	_ = tmpl.Execute(w, data)
@@ -346,6 +355,7 @@ func (s *Server) scrape(w http.ResponseWriter, r *http.Request) {
 	}
 
 	newJob.Data.Email = r.Form.Get("email") == "on"
+	newJob.Data.WebhookURL = strings.TrimSpace(r.Form.Get("webhook_url"))
 
 	proxies := strings.Split(r.Form.Get("proxies"), "\n")
 	if len(proxies) > 0 {
@@ -715,5 +725,83 @@ func securityHeaders(next http.Handler) http.Handler {
 				"connect-src 'self'")
 
 		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.apiKey == "" {
+			next.ServeHTTP(w, r)
+
+			return
+		}
+
+		// Always allow static assets (CSS, JS, images)
+		if strings.HasPrefix(r.URL.Path, "/static/") {
+			next.ServeHTTP(w, r)
+
+			return
+		}
+
+		// 1. Check X-API-Key header
+		key := r.Header.Get("X-API-Key")
+
+		// 2. Check Authorization header (Bearer or Basic)
+		if key == "" {
+			authHeader := r.Header.Get("Authorization")
+			if strings.HasPrefix(authHeader, "Bearer ") {
+				key = strings.TrimPrefix(authHeader, "Bearer ")
+			} else if strings.HasPrefix(authHeader, "Basic ") {
+				user, pass, ok := r.BasicAuth()
+				if ok && (pass == s.apiKey || user == s.apiKey) {
+					key = s.apiKey
+				}
+			}
+		}
+
+		// 3. Check Cookie
+		if key == "" {
+			if cookie, err := r.Cookie("api_key"); err == nil {
+				key = cookie.Value
+			}
+		}
+
+		// 4. Check Query Parameter (?api_key=...)
+		if key == "" {
+			key = r.URL.Query().Get("api_key")
+		}
+
+		// Key matches: allow request
+		if key == s.apiKey {
+			// If authenticated via query param in browser, set cookie for convenience
+			if r.URL.Query().Get("api_key") != "" && !strings.HasPrefix(r.URL.Path, "/api/") {
+				http.SetCookie(w, &http.Cookie{
+					Name:     "api_key",
+					Value:    s.apiKey,
+					Path:     "/",
+					HttpOnly: true,
+					SameSite: http.SameSiteLaxMode,
+				})
+			}
+
+			next.ServeHTTP(w, r)
+
+			return
+		}
+
+		// Unauthorized:
+		// API routes return JSON 401
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			renderJSON(w, http.StatusUnauthorized, apiError{
+				Code:    http.StatusUnauthorized,
+				Message: "Unauthorized: invalid or missing API key. Provide via X-API-Key or Authorization header.",
+			})
+
+			return
+		}
+
+		// Web UI routes prompt browser Basic Auth
+		w.Header().Set("WWW-Authenticate", `Basic realm="Google Maps Scraper - Enter API Key as Password"`)
+		http.Error(w, "Unauthorized: valid API key required to access this dashboard", http.StatusUnauthorized)
 	})
 }

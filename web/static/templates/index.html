@@ -109,6 +109,10 @@
                                 <label for="maxtime">Max job time:</label>
                                 <input type="text" id="maxtime" name="maxtime" value="{{.MaxTime}}">
                             </div>
+                            <div class="form-group">
+                                <label for="webhook_url">Webhook URL (optional):</label>
+                                <input type="url" id="webhook_url" name="webhook_url" placeholder="https://my-crm.com/api/webhook" value="{{.WebhookURL}}">
+                            </div>
                         </fieldset>
                     </details>
                     <details class="expandable-section">
